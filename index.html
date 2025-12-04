@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>XAUUSD BUY-ONLY — SMC (8-confirmations, tiered signals, Oversold-trigger)</title>
+<style>
+  :root{--bg:#07121a;--card:#0f1720;--accent:#29a745;--muted:#9aa;}
+  body{background:var(--bg);color:#fff;font-family:Inter,system-ui,Arial;padding:18px;margin:0;}
+  .wrap{max-width:980px;margin:0 auto;}
+  h1{font-size:20px;margin:0 0 10px 0;}
+  p.small{color:var(--muted);margin:6px 0 14px 0;}
+  label{font-size:13px;color:var(--muted);display:block;margin-top:8px;}
+  input,select{width:100%;padding:10px;border-radius:8px;border:1px solid #222;background:var(--card);color:#fff;margin-top:6px;}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:start;}
+  .full{grid-column:1/-1;}
+  button{padding:10px 14px;border-radius:8px;border:none;background:var(--accent);color:#fff;cursor:pointer;margin:8px 6px 8px 0;}
+  button.stop{background:#06311a;}
+  .status{padding:10px;background:#071820;border-radius:8px;margin-top:12px;}
+  .signalBox{padding:12px;margin-top:12px;border-radius:8px;display:none;}
+  .logs{background:#00110a;color:#7fff9a;padding:10px;height:320px;overflow:auto;border-radius:6px;margin-top:12px;font-family:monospace;white-space:pre-line;}
+  .chip{background:#071820;padding:6px 10px;border-radius:8px;color:var(--muted);font-size:13px;}
+  small{color:var(--muted);}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>XAUUSD BUY-ONLY — NUCLEAR SMC (8 confirms, Oversold-trigger)</h1>
+    <p class="small">BUY-only model — 8 indicators. Signals fire at 4/8 → 5/8 → 6/8 → 7/8 → 8/8. New rule: BUYs start only after a prior 1H <b>oversold</b> condition that has recovered (configurable). Uses TwelveData for price, Telegram alerts, TP tiers, monitoring + position estimate.</p>
+
+    <label>TwelveData API Key</label>
+    <input id="td_key" placeholder="Put TwelveData API key here (do NOT commit)">
+
+    <label>Telegram Bot Token</label>
+    <input id="tg_token" placeholder="123456:ABC...">
+
+    <label>Chat IDs (comma separated)</label>
+    <input id="tg_chats" placeholder="12345678,-1001234567890">
+
+    <div class="row full">
+      <div>
+        <label>Account Balance (USD)</label>
+        <input id="acct_balance" placeholder="1000">
+      </div>
+      <div>
+        <label>Risk per trade (%)</label>
+        <input id="risk_pct" placeholder="0.5">
+      </div>
+
+      <div>
+        <label>TP sizes (comma %) — TP1,TP2,TP3 (example: 30,30,40)</label>
+        <input id="tp_sizes" placeholder="30,30,40">
+      </div>
+      <div>
+        <label>EMA trend filter (1H) — On/Off</label>
+        <select id="ema_filter"><option value="on">On</option><option value="off">Off</option></select>
+      </div>
+
+      <div>
+        <label>1H RSI — max allowed for LONG (avoid overbought) (default 65)</label>
+        <input id="rsi_long_max" placeholder="65">
+      </div>
+      <div>
+        <label>Cooldown between signals (minutes)</label>
+        <input id="cooldown_min" placeholder="60">
+      </div>
+
+      <div>
+        <label>1H RSI Oversold threshold (start BUYs only after OS) (default 30)</label>
+        <input id="rsi_oversold" placeholder="30">
+      </div>
+      <div>
+        <label>Oversold lookback (how many 1H candles to check for prior OS) (default 3)</label>
+        <input id="rsi_os_lookback" placeholder="3">
+      </div>
+
+    </div>
+
+    <div style="margin-top:10px;">
+      <button id="startBtn">Start Bot</button>
+      <button id="stopBtn" class="stop">Stop Bot</button>
+      <span class="chip" id="runStatus">Status: Stopped</span>
+      <span class="chip" id="lastSignal">Last Signal: —</span>
+    </div>
+
+    <div id="signal" class="signalBox"></div>
+    <div class="status" id="summary">Config: BUY-only • 15m/1H/4H analysis • 1-min scheduler • Oversold gate enabled</div>
+    <div class="logs" id="logs"></div>
+  </div>
+
+<script>
+/* BUY-ONLY — 8-confirmations tiered signals (4/8 → 8/8)
+   New: requires a prior 1H oversold condition and current RSI recovery.
+*/
+
+// ========== CONFIG ==========
+const SYMBOL = "XAU/USD";
+const INTERVAL_MS = 60 * 1000; // 1 min scan
+const LOOKBACK_M15 = 200;
+const LOOKBACK_1H  = 220; // keep enough for RSI series
+const LOOKBACK_4H  = 120;
+const VOLUME_MULT = 2.2;
+const WICK_ATR_MULT = 1.1;
+const ATR_INCREASE_MULT = 1.15;
+const MSS_LOOKBACK = 30;
+const RR = 4;
+const MONITOR_INTERVAL_MS = 15 * 1000;
+
+let loopId = null;
+let running = false;
+let lastSignalTime = 0;
+let lastSentLevel = 0; // to avoid repeating same tier
+const activeSignals = [];
+let monitorId = null;
+
+const logsEl = document.getElementById('logs');
+const statusEl = document.getElementById('runStatus');
+const lastSignalEl = document.getElementById('lastSignal');
+const signalBox = document.getElementById('signal');
+
+function log(msg){
+  const t = new Date().toLocaleString();
+  logsEl.innerText += `[${t}] ${msg}\n`;
+  logsEl.scrollTop = logsEl.scrollHeight;
+}
+function setStatus(txt){ statusEl.innerText = 'Status: ' + txt; }
+function setLastSignal(txt){ lastSignalEl.innerText = 'Last Signal: ' + txt; }
+function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+function safeNum(v){ return typeof v === 'number' && !isNaN(v) ? v : 0; }
+function fmt(n,d=2){ return Number(n).toFixed(d); }
+
+// ========== TwelveData fetch ==========
+async function fetchTD(intervalKey, limit){
+  const key = document.getElementById('td_key').value.trim();
+  if(!key){ log('TwelveData key missing'); return []; }
+  const map = {'15m':'15min','1h':'1h','4h':'4h','1m':'1min'};
+  const intv = map[intervalKey] || intervalKey;
+  const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(SYMBOL)}&interval=${intv}&apikey=${encodeURIComponent(key)}&outputsize=${limit}&format=JSON&timezone=UTC`;
+  try{
+    const r = await fetch(url);
+    const j = await r.json();
+    if(!j || !j.values){ log('TD error: ' + (j && j.message ? j.message : JSON.stringify(j))); return []; }
+    return j.values.reverse().map(v=>({
+      t: new Date(v.datetime).getTime(),
+      o: safeNum(parseFloat(v.open)),
+      h: safeNum(parseFloat(v.high)),
+      l: safeNum(parseFloat(v.low)),
+      c: safeNum(parseFloat(v.close)),
+      v: safeNum(parseFloat(v.volume || 0))
+    }));
+  }catch(e){
+    log('FetchTD err: '+ e.message);
+    return [];
+  }
+}
+
+// ========== Technical helpers ==========
+function ATR(candles, period=14){
+  if(!candles || candles.length < period+1) return 0;
+  const trs=[];
+  for(let i=1;i<candles.length;i++){
+    const cur=candles[i], prev=candles[i-1];
+    trs.push(Math.max(cur.h-cur.l, Math.abs(cur.h-prev.c), Math.abs(cur.l-prev.c)));
+  }
+  let atr = trs.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  for(let i=period;i<trs.length;i++){
+    atr = (atr*(period-1) + trs[i]) / period;
+  }
+  return atr;
+}
+
+function SMA_of_ATR_series(candles, atrPeriod=14, smaPeriod=20){
+  if(candles.length < atrPeriod + smaPeriod) return 0;
+  const atrs=[];
+  for(let start=0; start <= candles.length - atrPeriod - 1; start++){
+    const slice = candles.slice(start, start + atrPeriod + 1);
+    atrs.push(ATR(slice, atrPeriod));
+  }
+  const lastSMAPeriod = atrs.slice(-smaPeriod);
+  return lastSMAPeriod.reduce((a,b)=>a+b,0)/lastSMAPeriod.length;
+}
+
+function EMA(values, period){
+  if(!values || values.length < period) return null;
+  const k = 2/(period+1);
+  let ema = values.slice(0,period).reduce((a,b)=>a+b,0)/period;
+  for(let i=period;i<values.length;i++) ema = values[i]*k + ema*(1-k);
+  return ema;
+}
+
+function RSI(candles, period=14){
+  if(!candles || candles.length < period+1) return null;
+  let gains=0, losses=0;
+  for(let i=candles.length-period;i<candles.length;i++){
+    const change = candles[i].c - candles[i-1].c;
+    if(change>0) gains += change; else losses += Math.abs(change);
+  }
+  const avgGain = gains/period, avgLoss = losses/period;
+  if(avgLoss === 0) return 100;
+  const rs = avgGain/avgLoss; return 100 - (100/(1+rs));
+}
+
+// produce RSI series (one value per candle from index (period) .. end)
+function rsiSeries(candles, period=14){
+  const out = [];
+  if(!candles || candles.length < period+1) return out;
+  for(let i=period;i<candles.length;i++){
+    const slice = candles.slice(0, i+1);
+    const v = RSI(slice, period);
+    out.push(v);
+  }
+  return out; // length = candles.length - period
+}
+
+// Detect bullish orderblock (simplified): find last bullish candle with exhaustion
+function detectBullOB(candles, lookback=30){
+  for(let i=candles.length-3;i>Math.max(0,candles.length-lookback);i--){
+    const c = candles[i];
+    const nxt = candles[i+1];
+    if(c.c > c.o && nxt.c > c.h){ // bullish candle followed by higher candle
+      return {idx:i, high:c.h, low:c.l, o:c.o, c:c.c};
+    }
+  }
+  return null;
+}
+
+// FVG detection (bull)
+function detectBullFVG(candles){
+  // check three-candle pattern: a.h < c.l -> bull FVG
+  for(let i=2;i<candles.length;i++){
+    const a = candles[i-2], c = candles[i];
+    if(a.h < c.l) return {idx:i, type:'bull', from:a.h, to:c.l};
+  }
+  return null;
+}
+
+// volume spike
+function isVolumeSpike(candles, mult=VOLUME_MULT){
+  if(!candles || candles.length < 12) return false;
+  const last = candles[candles.length-1].v;
+  const avg = candles.slice(-11,-1).reduce((s,c)=>s+c.v,0)/10;
+  return last > avg * mult;
+}
+
+// trend bias from 4H (bull)
+function trendBiasFrom4h(h4){
+  if(!h4 || h4.length < 20) return 'neutral';
+  const closes = h4.map(c=>c.c);
+  const sma20 = closes.slice(-21,-1).reduce((a,b)=>a+b,0)/20;
+  const last = closes[closes.length-1];
+  return last > sma20 ? 'bull' : last < sma20 ? 'bear' : 'neutral';
+}
+
+// MSS detection (bull break)
+function detectMSS(candles){
+  if(!candles || candles.length < MSS_LOOKBACK + 5) return null;
+  const start = Math.max(0,candles.length-MSS_LOOKBACK);
+  let swingHigh=-Infinity, swingLow=Infinity;
+  for(let i=start;i<candles.length;i++){ if(candles[i].h>swingHigh) swingHigh=candles[i].h; if(candles[i].l<swingLow) swingLow=candles[i].l; }
+  const last = candles[candles.length-1];
+  // bull break when price makes fresh high and bullish close
+  if(last.h > swingHigh && last.c > last.o) return 'mss_bull_break';
+  return null;
+}
+
+// liquidity grab detection (bottom sweep)
+function detectLiquidityGrab(candles){
+  if(!candles || candles.length < 20) return {top:false, bottom:false, atr:0, vol:false};
+  const atr = ATR(candles,14);
+  let swingHigh=-Infinity, swingLow=Infinity;
+  const look = 20;
+  for(let i=Math.max(0,candles.length-look); i<candles.length;i++){
+    if(candles[i].h > swingHigh) swingHigh = candles[i].h;
+    if(candles[i].l < swingLow) swingLow = candles[i].l;
+  }
+  const last = candles[candles.length-1];
+  const wickTop = last.h - Math.max(last.c,last.o);
+  const wickBottom = Math.min(last.c,last.o) - last.l;
+  const volOk = isVolumeSpike(candles, VOLUME_MULT);
+  const topSweep = (last.h > swingHigh) && (wickTop > atr * WICK_ATR_MULT) && (last.c < last.o) && volOk;
+  const bottomSweep = (last.l < swingLow) && (wickBottom > atr * WICK_ATR_MULT) && (last.c > last.o) && volOk;
+  return {top:topSweep, bottom:bottomSweep, atr, volOk};
+}
+
+// ATR volatility shift
+function atrVolatilityShift(candles){
+  const atrNow = ATR(candles,14);
+  const atrSMA = SMA_of_ATR_series(candles,14,20);
+  if(!atrSMA) return false;
+  return atrNow > atrSMA * ATR_INCREASE_MULT;
+}
+
+// ========== Position sizing & TP builder ==========
+function getTPSizes(){
+  const s = document.getElementById('tp_sizes')?.value.trim() || '';
+  if(!s) return [30,30,40];
+  const arr = s.split(',').map(x=>parseFloat(x)).filter(x=>!isNaN(x));
+  if(arr.length !== 3) return [30,30,40];
+  const sum = arr.reduce((a,b)=>a+b,0);
+  if(sum !== 100) return arr.map(x=>Math.round(x / sum * 100));
+  return arr;
+}
+
+function estimatePositionSize(entry, sl){
+  const bal = parseFloat(document.getElementById('acct_balance')?.value) || 1000;
+  const riskPct = parseFloat(document.getElementById('risk_pct')?.value) || 0.5;
+  const riskUSD = bal * (riskPct/100);
+  const stopPips = Math.abs(entry - sl);
+  if(stopPips <= 0) return {units:0, riskUSD};
+  const units = Math.floor(riskUSD / stopPips);
+  return {units, riskUSD};
+}
+
+function buildTPs(entry, sl, direction='LONG'){
+  // for LONG: tp = entry + risk * multiplier
+  const risk = (direction === 'SHORT') ? (sl - entry) : (entry - sl);
+  const tp1 = (direction==='LONG') ? entry + risk * 1.0 : entry - risk * 1.0;
+  const tp2 = (direction==='LONG') ? entry + risk * 2.0 : entry - risk * 2.0;
+  const tp3 = (direction==='LONG') ? entry + risk * RR : entry - risk * RR;
+  const tps = [tp1, tp2, tp3];
+  const tpSizesPct = getTPSizes();
+  const sizes = tpSizesPct.map(p=>p/100);
+  return {tps, sizes};
+}
+
+// ========== Telegram ==========
+async function sendToTelegram(msgHtml){
+  const token = document.getElementById('tg_token').value.trim();
+  if(!token){ log('TG token not set'); return false; }
+  const chatStr = document.getElementById('tg_chats').value.trim();
+  if(!chatStr){ log('No chat IDs'); return false; }
+  const chatIds = chatStr.split(',').map(s=>s.trim()).filter(s=>s.length);
+  let allOk = true;
+  for(const id of chatIds){
+    const url = `https://api.telegram.org/bot${encodeURIComponent(token)}/sendMessage?chat_id=${encodeURIComponent(id)}&text=${encodeURIComponent(msgHtml)}&parse_mode=HTML&disable_web_page_preview=true`;
+    try{
+      const res = await fetch(url);
+      const j = await res.json();
+      if(j && j.ok) log('Sent to ' + id);
+      else { log('TG err: ' + JSON.stringify(j)); allOk = false; }
+    }catch(e){
+      log('TG send failed: ' + e.message);
+      allOk = false;
+    }
+    await sleep(250);
+  }
+  return allOk;
+}
+
+// ========== Monitoring active signals ==========
+async function monitorActiveSignals(){
+  if(!activeSignals.length){ if(monitorId){ clearInterval(monitorId); monitorId = null; } return; }
+  const latest = await fetchTD('1m', 2);
+  if(!latest || !latest.length) return;
+  const price = latest[latest.length-1].c;
+  for(const sig of activeSignals){
+    if(sig.status !== 'open') continue;
+    // LONG logic
+    for(let i=0;i<sig.tps.length;i++){
+      if(sig.filledSizes[i] >= 1) continue;
+      const tp = sig.tps[i];
+      if(price >= tp){
+        sig.filledSizes[i] = 1;
+        if(i===0){
+          const buffer = Math.max((ATR(latest,14)||0.5)*0.2, 0.1);
+          sig.sl = Math.max(sig.sl, sig.entry + buffer); // tighten SL for long
+        }
+        const portionPct = Math.round(sig.sizes[i]*100);
+        const msg = `<b>✅ TP${i+1} HIT</b>\n🟢 LONG\nTP${i+1}: <b>${fmt(tp,2)}</b>\nPortion: <b>${portionPct}%</b>\nNew SL: <b>${fmt(sig.sl,2)}</b>\nTime: ${new Date().toLocaleString()}`;
+        await sendToTelegram(msg);
+        log(`Signal ${sig.id} TP${i+1} hit at ${fmt(price)} (tp ${fmt(tp)})`);
+      }
+    }
+    // SL
+    if(price <= sig.sl){
+      const filled = sig.filledSizes.reduce((a,b)=>a+b,0);
+      const remaining = 1 - filled;
+      const posEst = estimatePositionSize(sig.entry, sig.sl);
+      let realizedUsd = 0;
+      for(let i=0;i<sig.tps.length;i++){
+        if(sig.filledSizes[i]) {
+          const exit = sig.tps[i];
+          const pnlPerUnit = (exit - sig.entry);
+          realizedUsd += pnlPerUnit * posEst.units * sig.sizes[i];
+        }
+      }
+      const pnlRemainingPerUnit = (sig.sl - sig.entry);
+      const pnlRemaining = (-1) * pnlRemainingPerUnit * posEst.units * remaining; // loss
+      const totalPnl = realizedUsd + pnlRemaining;
+      const msg = `<b>⛔ SL HIT — TRADE CLOSED</b>\n🟢 LONG\nSL: <b>${fmt(sig.sl,2)}</b>\nPrice: <b>${fmt(price,2)}</b>\nEstimated P&L: <b>$${fmt(totalPnl,2)}</b>\nTime: ${new Date().toLocaleString()}`;
+      await sendToTelegram(msg);
+      log(`Signal ${sig.id} SL hit at ${fmt(price)}; est P&L $${fmt(totalPnl,2)}`);
+      sig.status = 'closed';
+    }
+    const allFilled = sig.filledSizes.every(x=>x>=1);
+    if(allFilled && sig.status === 'open'){
+      const posEst = estimatePositionSize(sig.entry,sig.sl);
+      let totalPnl = 0;
+      for(let i=0;i<sig.tps.length;i++){
+        const exit=sig.tps[i];
+        totalPnl += (exit - sig.entry) * posEst.units * sig.sizes[i];
+      }
+      const msg = `<b>🏁 ALL TPs HIT — TRADE CLOSED</b>\n🟢 LONG\nFinal Price: <b>${fmt(price,2)}</b>\nEstimated P&L: <b>$${fmt(totalPnl,2)}</b>\nTime: ${new Date().toLocaleString()}`;
+      await sendToTelegram(msg);
+      log(`Signal ${sig.id} all TPs hit; est P&L $${fmt(totalPnl,2)}`);
+      sig.status='closed';
+    }
+  }
+  // cleanup
+  const cutoff = Date.now() - 6*60*60*1000;
+  for(let i=activeSignals.length-1;i>=0;i--){
+    if(activeSignals[i].status==='closed' || activeSignals[i].createdAt < cutoff) activeSignals.splice(i,1);
+  }
+  if(!activeSignals.length && monitorId){ clearInterval(monitorId); monitorId=null; }
+}
+
+// ========== SCAN (MAIN) ==========
+async function scanOnce(){
+  try{
+    const [m15,h1,h4] = await Promise.all([fetchTD('15m',LOOKBACK_M15), fetchTD('1h',LOOKBACK_1H), fetchTD('4h',LOOKBACK_4H)]);
+    if(!m15.length || !h1.length){ log('Not enough data'); return; }
+
+    const price = m15[m15.length-1].c;
+    const atr15 = ATR(m15,14);
+    const ob15 = detectBullOB(m15.slice(-80));
+    const ob1h = detectBullOB(h1.slice(-80));
+    const fvg = detectBullFVG(m15.slice(-60));
+    const volSpike = isVolumeSpike(m15);
+    const bias4h = trendBiasFrom4h(h4);
+    const atrShift = atrVolatilityShift(m15);
+    const mss = detectMSS(m15);
+    const liq = detectLiquidityGrab(m15);
+
+    // EMA & RSI filters on 1H
+    const closes1h = h1.map(c=>c.c);
+    const ema50_1h = EMA(closes1h,50);
+    const rsi1h = RSI(h1,14);
+
+    // ----- NEW: Oversold gating -----
+    const rsiOS = parseFloat(document.getElementById('rsi_oversold')?.value) || 30;
+    const osLook = parseInt(document.getElementById('rsi_os_lookback')?.value) || 3;
+    const rsiSeries1h = rsiSeries(h1,14); // length = h1.length - 14
+    let currentRsi = null, wasOversold = false;
+    if(rsiSeries1h.length){
+      currentRsi = rsiSeries1h[rsiSeries1h.length-1];
+      const recent = rsiSeries1h.slice(Math.max(0, rsiSeries1h.length - osLook));
+      wasOversold = recent.some(v => v < rsiOS);
+    }
+    // require that there WAS an oversold in recent lookback and current RSI rose above that oversold level
+    const afterOversoldRecovery = wasOversold && currentRsi !== null && currentRsi > rsiOS;
+
+    // 8 indicators — adapted for BUY (bullish cues)
+    const ob15bull = !!ob15;
+    const ob1h_bull = !!ob1h;
+    const fvgBull = !!fvg;
+    const volOk = volSpike;
+    const bias4hBull = bias4h === 'bull';
+    const atrOk = atrShift;
+    const mssBull = !!mss && mss.includes('bull');
+    const liqBottom = liq.bottom && liq.volOk;
+
+    const indicators = [ob15bull, ob1h_bull, fvgBull, volOk, bias4hBull, atrOk, mssBull, liqBottom];
+    const confirmed = indicators.filter(x=>x).length;
+
+    // EMA filter on 1H: require last1h > ema50 for LONG if enabled
+    const emaFilterOn = (document.getElementById('ema_filter')?.value || 'on') === 'on';
+    let trendOK = true;
+    if(emaFilterOn && ema50_1h){
+      const last1h = h1[h1.length-1].c;
+      if(last1h < ema50_1h) trendOK = false;
+    }
+    // RSI filter: require 1H RSI not too high (avoid overbought). Default max is 65
+    const rsiLongMax = parseFloat(document.getElementById('rsi_long_max')?.value) || 65;
+    let rsiOK = true;
+    if(rsi1h && rsi1h > rsiLongMax) rsiOK = false;
+
+    log(`Price ${fmt(price)} | Confirmed ${confirmed}/8 | 1H RSI:${currentRsi?fmt(currentRsi,2):'n/a'} EMA50:${ema50_1h?fmt(ema50_1h,2):'n/a'} OSgate:${afterOversoldRecovery}`);
+
+    // cooldown
+    const cooldown = (parseFloat(document.getElementById('cooldown_min')?.value) || 60) * 60000;
+    if(Date.now() - lastSignalTime < cooldown){
+      if(confirmed >= 4) log('Signal blocked by cooldown');
+      return;
+    }
+
+    // MAIN: require oversold gate (user wanted buy start AFTER oversold)
+    if(!afterOversoldRecovery){
+      if(confirmed >= 4) log('Blocked: Oversold gate not satisfied (wait for 1H oversold then recovery)');
+      return;
+    }
+
+    if(confirmed >= 4 && trendOK && rsiOK){
+      // Determine tier based on confirmed count
+      let tier = confirmed >= 8 ? 5 : confirmed === 7 ? 4 : confirmed === 6 ? 3 : confirmed === 5 ? 2 : 1;
+      // Prevent repeated sending of same tier for same epoch: send only if tier > lastSentLevel
+      if(tier <= lastSentLevel){
+        log(`Tier ${tier} already sent or lower than last sent (${lastSentLevel}) — skipping.`);
+        return;
+      }
+
+      // Build entry/SL/TPs for LONG
+      const entry = price;
+      const slBuffer = Math.max(atr15 * 1.2, 0.5);
+      const sl = entry - slBuffer; // for long, SL below entry
+      const {tps, sizes} = buildTPs(entry, sl, 'LONG');
+      const pos = estimatePositionSize(entry, sl);
+
+      const msgLines = [];
+      msgLines.push(`<b>⚡ XAUUSD BUY SIGNAL — Tier ${tier} (${confirmed}/8)</b>`);
+      msgLines.push('🟢 <b>LONG</b>');
+      msgLines.push('');
+      msgLines.push(`Tier: <b>${tier}</b> (4→1,5→2,6→3,7→4,8→5)`);
+      msgLines.push(`Entry (LTP): <b>${fmt(entry,2)}</b>`);
+      msgLines.push(`SL: <b>${fmt(sl,2)}</b>`);
+      msgLines.push(`TPs: <b>${tps.map(x=>fmt(x,2)).join(', ')}</b>`);
+      msgLines.push(`TP distribution: <b>${getTPSizes().join('% , ')}%</b>`);
+      msgLines.push(`Est. units: <b>${pos.units}</b> (risk $${fmt(pos.riskUSD,2)})`);
+      msgLines.push('');
+      msgLines.push(`<b>Confirmed indicators:</b> ${confirmed}/8`);
+      msgLines.push(`Flags: OB15=${ob15bull} OB1H=${ob1h_bull} FVG=${fvgBull} VolSpike=${volOk} Bias4H=${bias4hBull} ATRshift=${atrOk} MSS=${mssBull} BottomSweep=${liqBottom}`);
+      if(currentRsi) msgLines.push(`<b>1H RSI:</b> ${fmt(currentRsi,2)}`);
+      if(ema50_1h) msgLines.push(`<b>1H EMA50:</b> ${fmt(ema50_1h,2)}`);
+      msgLines.push(`Time: ${new Date().toLocaleString()}`);
+
+      const tgMsg = msgLines.join('\n');
+
+      const ok = await sendToTelegram(tgMsg);
+      if(ok){
+        const sig = {
+          id: 'b'+Date.now()+Math.floor(Math.random()*999),
+          direction:'LONG',
+          tier,
+          confirmed,
+          entry,
+          sl,
+          tps,
+          sizes,
+          filledSizes:[0,0,0],
+          status:'open',
+          createdAt:Date.now()
+        };
+        activeSignals.push(sig);
+        if(!monitorId) monitorId = setInterval(monitorActiveSignals, MONITOR_INTERVAL_MS);
+        log(`Registered active LONG signal id=${sig.id} tier=${tier} confirmed=${confirmed}`);
+        lastSignalTime = Date.now();
+        lastSentLevel = tier;
+        setLastSignal(new Date().toLocaleTimeString());
+        // Signal box UI
+        signalBox.style.display = 'block';
+        signalBox.style.background = '#06311a';
+        signalBox.innerHTML = tgMsg.replace(/\n/g,'<br>');
+      } else {
+        log('Signal NOT registered because TG failed');
+      }
+    } else {
+      if(confirmed >= 4){
+        if(!trendOK) log('Signal blocked by EMA trend filter (1H EMA50)');
+        if(!rsiOK) log('Signal blocked by RSI filter (1H RSI too high)');
+      }
+    }
+
+  }catch(e){ log('Scan error: '+(e && e.message ? e.message : e)); }
+}
+
+// ========== CONTROLS ==========
+document.getElementById('startBtn').addEventListener('click', ()=>{
+  if(running) return;
+  const key = document.getElementById('td_key').value.trim();
+  if(!key){ alert('TwelveData API key daalo pehle.'); return; }
+  running = true; setStatus('Running'); log('Bot started (BUY-only, Oversold gate)'); scanOnce();
+  loopId = setInterval(scanOnce, INTERVAL_MS);
+});
+document.getElementById('stopBtn').addEventListener('click', ()=>{
+  if(loopId) clearInterval(loopId); if(monitorId) clearInterval(monitorId);
+  running = false; monitorId=null; setStatus('Stopped'); log('Bot stopped'); lastSentLevel=0;
+});
+if(location.hostname.includes('github.io')){
+  setTimeout(()=>{ const k=document.getElementById('td_key').value.trim(); const t=document.getElementById('tg_token').value.trim(); if(k && t) document.getElementById('startBtn').click(); },3000);
+}
+
+</script>
+</body>
+</html>
